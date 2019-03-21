@@ -1,16 +1,40 @@
-version: 3.0.0-alpha-{build}
-os: Visual Studio 2015
+version: 3.1.0-ci@{build}
+os: Visual Studio 2017
 configuration: Release
+skip_tags: false
+branches:
+  except:
+    - azure-pipelines
 environment:
+  APPVEYORAPIKEY:
+    secure: f6ZDvXLvu8fryoFvnGfIUdpvlUC6Rft/qZKbWGh5CFw=
+  DOCKERUSERNAME: rnwood
+  DOCKERPASSWORD:
+    secure: 5jWYD10eY+CLicPtEtSMng==
+  FRAMEWORK: netcoreapp2.2
   matrix:
-    - RUNTIME: win7-x64
-      FRAMEWORK: net461
-    - RUNTIME: win7-x86
-      FRAMEWORK: net461
-    - RUNTIME: ubuntu.16.04-x64
-      FRAMEWORK: netcoreapp1.0
-    - RUNTIME: osx.10.10-x64
-      FRAMEWORK: netcoreapp1.0	  
+    - RUNTIME: noruntime
+      APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+    - RUNTIME: win-x64    
+      APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+    - RUNTIME: linux-x64
+      APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+    - RUNTIME: osx-x64
+      APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+    - RUNTIME: win-x86
+      APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+    - RUNTIME: win-arm
+      APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+    - RUNTIME: linux-arm
+      APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+    - RUNTIME: docker
+      DOCKERPLATFORM: windows-amd64
+      DOCKERFILE: windows
+      APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+    - RUNTIME: docker
+      DOCKERPLATFORM: linux-amd64
+      DOCKERFILE: linux
+      APPVEYOR_BUILD_WORKER_IMAGE: Ubuntu
 assembly_info:
   patch: true
   file: '**\SolutionInfo.*'
@@ -18,29 +42,103 @@ assembly_info:
   assembly_file_version: '{version}'
   assembly_informational_version: '{version}'
 nuget:
-  account_feed: true
-  project_feed: true
+  account_feed: false
+  project_feed: false
+init:
+ - ps: |
+    $ErrorActionPreference="Stop"
+    $version = $env:APPVEYOR_BUILD_VERSION
+    if ($env:APPVEYOR_REPO_TAG_NAME) {
+       write-host "Using label ${env:APPVEYOR_REPO_TAG_NAME} as version number"
+       try {
+           Update-AppveyorBuild -version $env:APPVEYOR_REPO_TAG_NAME
+       } catch {
+          Add-AppveyorMessage -Message "Skipping github release label."
+          
+          Exit-AppveyorBuild
+       }
+       $version = $env:APPVEYOR_REPO_TAG_NAME
+       Set-AppveyorBuildVariable 'PRERELEASE' (($version.Contains("-")).ToString())
+    } else {
+        $paddedbuild = ([int]$env:APPVEYOR_BUILD_NUMBER).ToString("0000")
+        write-host "Version is $version - replacing @${env:APPVEYOR_BUILD_NUMBER} with $paddedbuild"
+        Update-AppveyorBuild -version ($version.Replace("@${env:APPVEYOR_BUILD_NUMBER}", "$paddedbuild"))
+        Set-AppveyorBuildVariable 'PRERELEASE' "true"
+    }
+    
 install:
-- cmd: |
-    dotnet restore
-    npm install -g gulp bower
+- ps: |
+    if ($env:RUNTIME -ne "docker") {
+        cmd /c powershell Install-Product node ''
+    }
 build_script:
- - cmd: dotnet build Rnwood.Smtp4dev -c %Configuration% -r %RUNTIME% -f %FRAMEWORK%
+ - ps: |
+    if ($env:RUNTIME -eq "docker") {
+      docker pull rnwood/smtp4dev:$($env:DOCKERPLATFORM)-v3
+      docker build --cache-from rnwood/smtp4dev:$($env:DOCKERPLATFORM)-v3 -m 4g -t rnwood/smtp4dev:$($env:DOCKERPLATFORM)-v3 -f Dockerfile.$($env:DOCKERFILE) --build-arg version=$env:APPVEYOR_BUILD_VERSION .
+      docker tag rnwood/smtp4dev:$($env:DOCKERPLATFORM)-v3 rnwood/smtp4dev:$($env:DOCKERPLATFORM)-$($env:APPVEYOR_BUILD_VERSION)	  
+    } else {
+        dotnet build Smtp4dev.sln -c $env:Configuration -p:version=$env:APPVEYOR_BUILD_VERSION
+    }
 after_build:
  - ps: |
-    $versionsuffix=$("{0:D4}" -f [convert]::ToInt32($env:APPVEYOR_BUILD_NUMBER, 10))
-    dotnet pack Rnwood.SmtpServer -c $env:Configuration --version-suffix $versionsuffix
-    get-item Rnwood.SmtpServer\bin\$($env:Configuration)\*.nupkg | foreach-object { appveyor PushArtifact $_.FullName } 
-    dotnet publish Rnwood.Smtp4dev -c $env:Configuration -r $env:Runtime  --version-suffix $versionsuffix
-build:
-  publish_nuget: false
-  publish_nuget_symbols: false
-  parallel: true
-  verbosity: minimal
+    if ($env:RUNTIME -eq "docker") {
+    } elseif ($env:RUNTIME -ne "noruntime") {
+       dotnet publish Rnwood.Smtp4dev -c $env:Configuration -f $env:FRAMEWORK -r $env:RUNTIME -p:version=$env:APPVEYOR_BUILD_VERSION -o publish
+    } else {
+       dotnet publish Rnwood.Smtp4dev -c $env:Configuration -f $env:FRAMEWORK -p:version=$env:APPVEYOR_BUILD_VERSION -o publish -p:PackAsTool=true
+       dotnet pack Rnwood.Smtp4dev -c $env:Configuration -p:version=$env:APPVEYOR_BUILD_VERSION -p:PackAsTool=true
+    }
+before_deploy:
+ - ps: |
+    if ($env:RUNTIME -eq "docker") {
+        "$env:DOCKERPASSWORD" | docker login -u "$env:DOCKERUSERNAME" --password-stdin
+        docker push rnwood/smtp4dev:$($env:DOCKERPLATFORM)-v3
+        docker push rnwood/smtp4dev:$($env:DOCKERPLATFORM)-$($env:APPVEYOR_BUILD_VERSION)
+    }
+after_deploy:
+ - ps: |
+    if ($env:APPVEYOR_REPO_TAG -eq "false") {
+      $headers = @{
+        "Authorization" = "Bearer $($env:APPVEYORAPIKEY)"
+        "Content-type" = "application/json"
+      }
+      $history = Invoke-RestMethod -Uri "https://ci.appveyor.com/api/projects/$($env:APPVEYOR_REPO_NAME)/history?recordsNumber=25&branch=$($env:APPVEYOR_REPO_BRANCH)" -Headers $headers  -Method Get
+      $buildtoremove = $history.builds | where-object { $_.tag -eq $env:APPVEYOR_BUILD_VERSION}
+      if ($buildtoremove) {
+        Invoke-RestMethod -uri "https://ci.appveyor.com/api/builds/$($env:APPVEYOR_REPO_NAME)/$($buildtoremove.version)"  -Headers $headers  -Method Delete
+        Invoke-RestMethod -uri "https://ci.appveyor.com/api/account/$($env:APPVEYOR_ACCOUNT_NAME)/builds/$($buildtoremove.buildid)"  -Headers $headers  -Method Delete
+      }
+    }
 artifacts:
-- path: Rnwood.Smtp4dev\bin\$(configuration)\$(framework)\$(runtime)\publish
-  name: Smtp4dev-$($runtime)-v$(appveyor_build_version)
+- path: Rnwood.Smtp4dev\publish
+  name: Smtp4dev-$(runtime)-v$(appveyor_build_version)
   type: zip
-- path: Rnwood.SmtpServer\bin\$(configuration)\*.nupkg
-test_script:
-- cmd: dotnet test Rnwood.SmtpServer.Tests -f %FRAMEWORK%
+- path: Rnwood.Smtp4dev\bin\pkg\*.nupkg
+cache:
+    - Rnwood.Smtp4dev\node_modules -> Rnwood.Smtp4dev\package.json
+deploy:    
+- provider: GitHub
+  artifact: /.*\..*/
+  auth_token:
+    secure: 5zLYIRVYHWHyZYOUZ2F46AvAYb3OLIWs35PQUddGkyK3xkV7qCmaMT38PJY6OiY7
+  prerelease: $(PRERELEASE)
+  tag: $(APPVEYOR_REPO_TAG_NAME)
+  on:
+    appveyor_repo_tag: true
+- provider: GitHub
+  artifact: /.*\..*/
+  auth_token:
+    secure: 5zLYIRVYHWHyZYOUZ2F46AvAYb3OLIWs35PQUddGkyK3xkV7qCmaMT38PJY6OiY7
+  prerelease: $(PRERELEASE)
+  on:
+    branch: master
+    appveyor_repo_tag: false
+- provider: NuGet
+  api_key:
+    secure: ISMI/iLYa+IKyqPkWpEYwgOceuVrR8mX3+sGEFr04Uo7FoM1goIGOqpr0JalCJPe
+  skip_symbols: false
+  artifact: /.*\.nupkg/
+  on:
+    branch: master
+  

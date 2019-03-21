@@ -1,45 +1,87 @@
-﻿using Microsoft.AspNetCore.Hosting;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.PlatformAbstractions;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.Design;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Reflection;
-using System.Threading.Tasks;
 
-#if NET461
-using Microsoft.AspNetCore.Hosting.WindowsServices;
-#endif
+using Microsoft.AspNetCore;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Configuration;
+
+using Rnwood.Smtp4dev.Service;
 
 namespace Rnwood.Smtp4dev
 {
     public class Program
     {
+        public static bool IsService { get; private set; }
+
         public static void Main(string[] args)
         {
-            var host = new WebHostBuilder()
-                .UseKestrel()
-                .UseContentRoot(Directory.GetCurrentDirectory())
-                .UseIISIntegration()
-                .UseStartup<Startup>()
-                .Build();
+            string version = FileVersionInfo.GetVersionInfo(typeof(Program).Assembly.Location).ProductVersion;
+            Console.WriteLine($"smtp4dev version {version}");
+            Console.WriteLine("https://github.com/rnwood/smtp4dev\n");
 
-            if (args.Contains("--service", StringComparer.OrdinalIgnoreCase))
+            if (!Debugger.IsAttached && args.Contains("--service"))
+                IsService = true;
+
+            var host = BuildWebHost(args.Where(arg => arg != "--service").ToArray());
+
+            if (IsService)
             {
-#if NET461
-                host.RunAsService();
-#else
-                Console.Error.WriteLine("ERROR --service not supported on this platform");
-                Environment.Exit(1);
-#endif
+                host.RunAsSmtp4devService();
             }
             else
             {
                 host.Run();
             }
+        }
+
+        private static string GetContentRoot()
+        {
+            string installLocation = Path.GetDirectoryName(typeof(Program).Assembly.Location);
+
+            if (Directory.Exists(Path.Join(installLocation, "wwwroot")))
+            {
+                return installLocation;
+            }
+
+            string cwd = Directory.GetCurrentDirectory();
+            if (Directory.Exists(Path.Join(cwd, "wwwroot")))
+            {
+                return cwd;
+            }
+
+            throw new ApplicationException($"Unable to find wwwroot in either '{installLocation}' or the CWD '{cwd}'");
+        }
+
+        private static IWebHost BuildWebHost(string[] args)
+        {
+            Directory.SetCurrentDirectory(GetContentRoot());
+
+            return WebHost
+                .CreateDefaultBuilder(args)
+                .UseContentRoot(Directory.GetCurrentDirectory())
+                .ConfigureAppConfiguration(
+                    (hostingContext, config) =>
+                        {
+                            var env = hostingContext.HostingEnvironment;
+                            config
+                                .SetBasePath(env.ContentRootPath)
+                                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                                .AddEnvironmentVariables()
+                                .AddCommandLine(args, new
+                                Dictionary<string, string>{
+                                    { "--smtpport", "ServerOptions:Port"},
+                                    { "--db", "ServerOptions:Database" },
+                                    { "--messagestokeep", "ServerOptions:NumberOfMessagesToKeep" },
+                                    { "--sessionstokeep", "ServerOptions:NumberOfSessionsToKeep" }
+                                })
+                                .Build();
+                        })
+                .UseStartup<Startup>()
+                .Build();
         }
     }
 }

@@ -1,63 +1,114 @@
-﻿using Microsoft.AspNetCore.Builder;
+using System;
+using System.IO;
+using System.Threading.Tasks;
+
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Razor;
-using Microsoft.DotNet.ProjectModel.Resolution;
+using Microsoft.AspNetCore.SpaServices.Webpack;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.PlatformAbstractions;
-using Rnwood.Smtp4dev.API;
-using Rnwood.Smtp4dev.Model;
-using Rnwood.Smtp4dev.UI;
-using System;
-using System.Threading.Tasks;
+
+using Rnwood.Smtp4dev.DbModel;
+using Rnwood.Smtp4dev.Hubs;
+using Rnwood.Smtp4dev.Server;
+using Microsoft.Net.Http.Headers;
 
 namespace Rnwood.Smtp4dev
 {
     public class Startup
     {
-        public Startup(IHostingEnvironment env)
+        public Startup(IConfiguration configuration)
         {
-            var builder = new ConfigurationBuilder()
-                .SetBasePath(env.ContentRootPath)
-                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-                .AddJsonFile($"appsettings.{env.EnvironmentName}.json", optional: true)
-                .AddEnvironmentVariables();
-
-            if (env.IsDevelopment())
-            {
-            }
-            Configuration = builder.Build();
+            Configuration = configuration;
         }
 
-        public IConfigurationRoot Configuration { get; }
+        public IConfiguration Configuration { get; }
 
         // This method gets called by the runtime. Use this method to add services to the container.
         public void ConfigureServices(IServiceCollection services)
         {
-            // Add framework services.
-
-            services.UseSmtp4dev();
+            var serverOptions = Configuration.GetSection("ServerOptions").Get<ServerOptions>();
+           
             services.AddMvc();
+
+            
+            services.AddDbContext<Smtp4devDbContext>(opt => {
+
+                if (string.IsNullOrEmpty(serverOptions.Database) )
+                {
+                    Console.WriteLine("Using in memory database.");
+                    opt.UseInMemoryDatabase("main");
+                }
+                else
+                {
+                    Console.WriteLine("Using Sqlite database at " + Path.GetFullPath(serverOptions.Database));
+                    opt.UseSqlite($"Data Source='{serverOptions.Database}'");
+                }
+            }, ServiceLifetime.Transient, ServiceLifetime.Singleton);
+
+            services.AddSingleton<Smtp4devServer>();
+            services.AddSingleton<Func<Smtp4devDbContext>>(sp => (() => sp.GetService<Smtp4devDbContext>()));
+
+            services.Configure<ServerOptions>(Configuration.GetSection("ServerOptions"));
+
+            services.AddSignalR();
+
+            services.AddSingleton<MessagesHub>();
+            services.AddSingleton<SessionsHub>();
         }
 
-        // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
-        public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory loggerFactory)
-        {
-            loggerFactory.AddConsole(Configuration.GetSection("Logging"));
-            loggerFactory.AddDebug();
 
-            app.UseDeveloperExceptionPage();
-            app.UseBrowserLink();
+        // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
+        public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory log)
+        {
+            app.UseExceptionHandler(new ExceptionHandlerOptions
+            {
+                ExceptionHandler = new JsonExceptionMiddleware().Invoke
+            });
+
+            app.UseDefaultFiles();
+
+
+            bool webpackConfigPresent = File.Exists(Path.Combine(env.ContentRootPath, "webpack.config.js"));
+
+			if (env.IsDevelopment() && webpackConfigPresent) {
+			    app.UseWebpackDevMiddleware(new WebpackDevMiddlewareOptions
+                {
+                    HotModuleReplacement = true
+                });
+			}
 
             app.UseStaticFiles();
+
+            app.UseWebSockets();
+            app.UseSignalR(routes =>
+            {
+                routes.MapHub<MessagesHub>("/hubs/messages");
+                routes.MapHub<SessionsHub>("/hubs/sessions");
+            });
 
             app.UseMvc(routes =>
             {
                 routes.MapRoute(
                     name: "default",
-                    template: "{controller=App}/{action=Index}/{id?}");
+                    template: "{controller=Home}/{action=Index}/{id?}");
+
+                routes.MapSpaFallbackRoute(
+                    name: "spa-fallback",
+                    defaults: new { controller = "Home", action = "Index" });
             });
+
+
+            Smtp4devDbContext context = app.ApplicationServices.GetService<Smtp4devDbContext>();
+            if (!context.Database.IsInMemory())
+            {
+                context.Database.Migrate();
+            }
+
+            app.ApplicationServices.GetService<Smtp4devServer>().Start();
         }
+        
     }
 }
